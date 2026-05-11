@@ -2942,6 +2942,17 @@ struct llama_model {
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
 
+    // YOCO cross-decoder shared KV projection (original YOCO: single global set)
+    struct ggml_tensor * cross_kv_norm = nullptr;
+    struct ggml_tensor * cross_wk = nullptr;
+    struct ggml_tensor * cross_wv = nullptr;
+
+    // YOCO-U: per-stage shared KV projection (U stages, each with own K̂, V̂)
+    std::vector<ggml_tensor *> yoco_u_cross_kv_norm;
+    std::vector<ggml_tensor *> yoco_u_cross_wk;
+    std::vector<ggml_tensor *> yoco_u_cross_wv;
+    int yoco_u_num_stages = 0;
+
     // classifier
     struct ggml_tensor * cls;
     struct ggml_tensor * cls_b;
@@ -6108,7 +6119,11 @@ static void llm_load_hparams(
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
+                // YOCO sliding window (optional)
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+
                 switch (hparams.n_layer) {
+                    case 14: model.type = e_model::MODEL_XL; break;   // YOCO-1.5B (7 self-decoder + 7 cross-decoder)
                     case 24: model.type = e_model::MODEL_700M; break; // 1bitLLM/bitnet_b1_58-large
                     case 26: model.type = e_model::MODEL_3B; break;   // 1bitLLM/bitnet_b1_58-3B
                     default: model.type = e_model::MODEL_UNKNOWN;
@@ -8683,19 +8698,61 @@ static bool llm_load_tensors(
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                     }
 
+                    // YOCO shared cross-decoder KV projection (optional, original YOCO)
+                    model.cross_kv_norm = ml.create_tensor(ctx_output, "yoco_cross_kv_norm.weight", {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                    model.cross_wk      = ml.create_tensor(ctx_output, "yoco_cross_k.weight",       {n_embd, n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                    model.cross_wv      = ml.create_tensor(ctx_output, "yoco_cross_v.weight",       {n_embd, n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                    // YOCO-U: per-stage shared KV projection (optional)
+                    {
+                        auto * t0 = ml.create_tensor(ctx_output, "yoco_u_stage_0_cross_kv_norm.weight", {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        if (t0 != nullptr) {
+                            model.yoco_u_cross_kv_norm.push_back(t0);
+                            model.yoco_u_cross_wk.push_back(ml.create_tensor(ctx_output, "yoco_u_stage_0_cross_k.weight", {n_embd, n_embd_gqa}));
+                            model.yoco_u_cross_wv.push_back(ml.create_tensor(ctx_output, "yoco_u_stage_0_cross_v.weight", {n_embd, n_embd_gqa}));
+                            for (int s = 1; s < 64; ++s) {
+                                std::string norm_name = "yoco_u_stage_" + std::to_string(s) + "_cross_kv_norm.weight";
+                                auto * ts = ml.create_tensor(ctx_output, norm_name, {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                                if (ts == nullptr) break;
+                                model.yoco_u_cross_kv_norm.push_back(ts);
+                                model.yoco_u_cross_wk.push_back(ml.create_tensor(ctx_output, "yoco_u_stage_" + std::to_string(s) + "_cross_k.weight", {n_embd, n_embd_gqa}));
+                                model.yoco_u_cross_wv.push_back(ml.create_tensor(ctx_output, "yoco_u_stage_" + std::to_string(s) + "_cross_v.weight", {n_embd, n_embd_gqa}));
+                            }
+                            model.yoco_u_num_stages = (int)model.yoco_u_cross_kv_norm.size();
+                        }
+                    }
+
+                    const bool has_yoco = (model.cross_kv_norm != nullptr);
+                    const bool has_yoco_u = (model.yoco_u_num_stages > 0);
+                    const int yoco_cross_start = has_yoco ? (n_layer / 2) : n_layer;
+                    // YOCO-U: layers_per_stage for alternating self/cross pattern
+                    const int yoco_u_lps = has_yoco_u ? (n_layer / model.yoco_u_num_stages) : 0;
+
                     for (int i = 0; i < n_layer; ++i) {
                         ggml_context * ctx_layer = ctx_for_layer(i);
                         ggml_context * ctx_split = ctx_for_layer_split(i);
 
                         auto & layer = model.layers[i];
 
-                        layer.attn_norm     = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd});
-                        layer.attn_sub_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SUB_NORM, "weight", i), {n_embd});
+                        // Determine if cross-decoder layer
+                        bool is_cross;
+                        if (has_yoco_u) {
+                            // YOCO-U: alternating pattern, odd layers are cross in 1:1 stages
+                            int pos_in_stage = i % yoco_u_lps;
+                            is_cross = (pos_in_stage >= yoco_u_lps / 2);
+                        } else {
+                            is_cross = has_yoco && (i >= yoco_cross_start);
+                        }
+                        const int64_t n_head_il = hparams.n_head(i);
+                        const int64_t q_dim_il = n_embd_head_k * n_head_il;
 
-                        layer.wq       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.attn_norm     = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd});
+                        layer.attn_sub_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SUB_NORM, "weight", i), {q_dim_il});
+
+                        layer.wq       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, q_dim_il});
                         layer.wk       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
                         layer.wv       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
-                        layer.wo       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+                        layer.wo       = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {q_dim_il, n_embd});
 
                         layer.ffn_norm     = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,     "weight", i), {n_embd});
                         layer.ffn_sub_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_SUB_NORM, "weight", i), {n_ff});
@@ -15253,17 +15310,46 @@ struct llm_build_context {
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
+        // YOCO: SWA mask for self-decoder layers
+        struct ggml_tensor * KQ_mask_swa = (hparams.n_swa > 0) ? build_inp_KQ_mask_swa() : nullptr;
+
+        // YOCO / YOCO-U: cross-decoder shared KV
+        const bool has_yoco = (model.cross_kv_norm != nullptr);
+        const bool has_yoco_u = (model.yoco_u_num_stages > 0);
+        const int yoco_cross_start = has_yoco ? (n_layer / 2) : n_layer;
+        const int yoco_u_lps = has_yoco_u ? (n_layer / model.yoco_u_num_stages) : 0;
+        struct ggml_tensor * cross_Kcur = nullptr;
+        struct ggml_tensor * cross_Vcur = nullptr;
+
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
+
+            // Determine if this layer is a cross-decoder layer
+            bool is_cross;
+            int current_stage = 0;
+            if (has_yoco_u) {
+                current_stage = il / yoco_u_lps;
+                int pos_in_stage = il % yoco_u_lps;
+                is_cross = (pos_in_stage >= yoco_u_lps / 2);
+            } else if (has_yoco) {
+                is_cross = (il >= yoco_cross_start);
+            } else {
+                is_cross = false;
+            }
+
+            const int64_t n_head_il = hparams.n_head(il);
+
+            // Choose mask: self-decoder uses SWA, cross-decoder uses global
+            struct ggml_tensor * KQ_mask_l = (!is_cross && KQ_mask_swa) ? KQ_mask_swa : KQ_mask;
 
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, cb, il);
             cb(cur, "attn_norm", il);
 
-            // self-attention
+            // attention
             {
-                // compute Q and K and RoPE them
+                // compute Q
                 struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
                 if (model.layers[il].wq_scale) {
                     Qcur = ggml_mul(ctx0, Qcur, model.layers[il].wq_scale);
@@ -15274,45 +15360,56 @@ struct llm_build_context {
                     cb(Qcur, "Qcur", il);
                 }
 
-                // B1.K
-                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
-                if (model.layers[il].wk_scale) {
-                    Kcur = ggml_mul(ctx0, Kcur, model.layers[il].wk_scale);
-                }
-                cb(Kcur, "Kcur", il);
-                if (model.layers[il].bk) {
-                    Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                struct ggml_tensor * Kcur;
+                struct ggml_tensor * Vcur;
+
+                if (!is_cross) {
+                    // Self-decoder: per-layer K, V
+                    Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
+                    if (model.layers[il].wk_scale) {
+                        Kcur = ggml_mul(ctx0, Kcur, model.layers[il].wk_scale);
+                    }
                     cb(Kcur, "Kcur", il);
-                }
+                    if (model.layers[il].bk) {
+                        Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                        cb(Kcur, "Kcur", il);
+                    }
 
-                // B1.V
-                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
-                if (model.layers[il].wv_scale) {
-                    Vcur = ggml_mul(ctx0, Vcur, model.layers[il].wv_scale);
-                }
-                cb(Vcur, "Vcur", il);
-                if (model.layers[il].bv) {
-                    Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                    Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
+                    if (model.layers[il].wv_scale) {
+                        Vcur = ggml_mul(ctx0, Vcur, model.layers[il].wv_scale);
+                    }
                     cb(Vcur, "Vcur", il);
+                    if (model.layers[il].bv) {
+                        Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                        cb(Vcur, "Vcur", il);
+                    }
+
+                    // RoPE K
+                    Kcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                    );
+                    cb(Kcur, "Kcur", il);
+                } else {
+                    // Cross-decoder: use shared K̂, V̂ (computed once after self-decoder)
+                    GGML_ASSERT(cross_Kcur != nullptr && "YOCO cross K/V not computed yet");
+                    Kcur = cross_Kcur;
+                    Vcur = cross_Vcur;
                 }
 
+                // RoPE Q (both self and cross decoder)
                 Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens), inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(Kcur, "Kcur", il);
-
                 cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                         NULL, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
 
                 cur = llm_build_norm(ctx0, cur, hparams,
                         model.layers[il].attn_sub_norm, NULL,
@@ -15366,6 +15463,61 @@ struct llm_build_context {
 
             cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "l_out", il);
+
+            // YOCO: after the last self-decoder layer, compute shared K̂, V̂
+            if (has_yoco && il == yoco_cross_start - 1) {
+                struct ggml_tensor * cross_input = cur;
+
+                // Apply cross KV norm: LN(X^(L/2))
+                cross_input = llm_build_norm(ctx0, cross_input, hparams,
+                        model.cross_kv_norm, NULL,
+                        LLM_NORM_RMS, cb, -1);
+                cb(cross_input, "cross_kv_norm", -1);
+
+                // Project to K̂, V̂
+                cross_Kcur = llm_build_lora_mm(lctx, ctx0, model.cross_wk, cross_input);
+                cb(cross_Kcur, "cross_Kcur", -1);
+
+                cross_Vcur = llm_build_lora_mm(lctx, ctx0, model.cross_wv, cross_input);
+                cb(cross_Vcur, "cross_Vcur", -1);
+
+                // RoPE K̂
+                cross_Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, cross_Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(cross_Kcur, "cross_Kcur_rope", -1);
+            }
+
+            // YOCO-U: after the last self-decoder layer in each stage, compute per-stage shared K̂, V̂
+            if (has_yoco_u && !is_cross) {
+                int pos_in_stage = il % yoco_u_lps;
+                if (pos_in_stage == yoco_u_lps / 2 - 1) {
+                    struct ggml_tensor * cross_input = cur;
+
+                    // Apply per-stage cross KV norm
+                    cross_input = llm_build_norm(ctx0, cross_input, hparams,
+                            model.yoco_u_cross_kv_norm[current_stage], NULL,
+                            LLM_NORM_RMS, cb, -1);
+                    cb(cross_input, "yoco_u_cross_kv_norm", il);
+
+                    // Project to per-stage K̂, V̂
+                    cross_Kcur = llm_build_lora_mm(lctx, ctx0, model.yoco_u_cross_wk[current_stage], cross_input);
+                    cb(cross_Kcur, "yoco_u_cross_Kcur", il);
+
+                    cross_Vcur = llm_build_lora_mm(lctx, ctx0, model.yoco_u_cross_wv[current_stage], cross_input);
+                    cb(cross_Vcur, "yoco_u_cross_Vcur", il);
+
+                    // RoPE K̂
+                    cross_Kcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, cross_Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                    );
+                    cb(cross_Kcur, "yoco_u_cross_Kcur_rope", il);
+                }
+            }
 
             // input for next layer
             inpL = cur;
@@ -16846,6 +16998,16 @@ static struct ggml_cgraph * llama_build_graph(
         case LLM_ARCH_BITNET:
             {
                 result = llm.build_bitnet();
+                // Dump compute graph on first call only
+                {
+                    static bool dumped = false;
+                    if (!dumped) {
+                        dumped = true;
+                        ggml_graph_print(result);
+                        ggml_graph_dump_dot(result, NULL, "/tmp/bitnet_graph.dot");
+                        LLAMA_LOG_INFO("%s: compute graph dumped to /tmp/bitnet_graph.dot\n", __func__);
+                    }
+                }
             } break;
         case LLM_ARCH_BITNET_B158:
         case LLM_ARCH_BITNET_25:
